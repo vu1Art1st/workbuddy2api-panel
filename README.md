@@ -258,18 +258,29 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
+Windows 提供两种构建方式，按使用习惯二选一：
+
 ```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
-go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
+# A. 原始命令行版：保留控制台，行为与上游构建方式一致
+.\scripts\build-windows.ps1 -Mode Console
+# 等价命令：go build -trimpath -ldflags "-s -w" -o wb2api.exe ./cmd/server
 
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
+# B. GUI 托盘版：无控制台窗口，带托盘菜单和启动成功提示
+.\scripts\build-windows.ps1 -Mode Tray
+# 等价命令：go build -tags tray -trimpath -ldflags "-s -w -H=windowsgui" -o wb2api-tray.exe ./cmd/server
 
-# 3) 浏览器打开面板添加账号
-#    http://127.0.0.1:7863/panel/
+# 同时构建两种版本
+.\scripts\build-windows.ps1 -Mode All
 ```
 
-exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
+两个版本均为单文件，前端资源已 embed：
+
+- `wb2api.exe`：CMD 控制台版。日志输出到终端，不显示托盘图标，不创建日切日志文件。
+- `wb2api-tray.exe`：GUI 托盘版。启动不显示命令行窗口，右键菜单提供「打开Panel」「退出程序」。日志按天写入 exe 同目录的 `logs\yymmdd.log`。
+
+Windows Release ZIP 会同时包含这两个 exe，用户可按使用习惯直接选择。
+
+托盘版首次启动会显示“程序已成功运行”提示，并在弹窗中说明可从托盘打开 Panel；勾选“以后不再显示”并点击“确定”后，会在 exe 同目录创建 `.startup-notice-disabled`，删除该文件即可恢复提示。
 
 ### 方式三：源码运行（开发调试）
 
@@ -288,6 +299,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o signin_bin ./cmd/signin
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o login ./cmd/login
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 ```
+
+> Windows GUI 托盘版需要额外使用 `-tags tray` 和 `-H=windowsgui`；请使用
+> `.\scripts\build-windows.ps1 -Mode Tray`，原始 CMD 版继续使用上面的裸 `go build` 即可。
 
 ### 添加账号（登录）
 
