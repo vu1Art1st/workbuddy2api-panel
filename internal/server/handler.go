@@ -66,6 +66,11 @@ type Config struct {
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
+
+	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
+	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
+	// 保持为空，归档与面板都不出现来源信息。
+	RecordClientInfo bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -74,8 +79,9 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:       h.cfg.APIKey,
-		SoftCooldown: h.cfg.SoftCooldown,
+		APIKey:           h.cfg.APIKey,
+		SoftCooldown:     h.cfg.SoftCooldown,
+		RecordClientInfo: h.cfg.RecordClientInfo,
 	}
 }
 
@@ -139,6 +145,9 @@ func NewHandler(cfg Config) *Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		if h.loadLive().RecordClientInfo {
+			trace.captureClientInfo(r)
+		}
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
 		obs := &responseObserver{ResponseWriter: w}
 		w.Header().Set("X-Request-Id", trace.id)
@@ -219,6 +228,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// credit_floor 生效的积分保底值（0 = 关闭）。与 accounts[].credits +
+		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
+		// （运维口径：缺失会让人误以为没记录）。
+		"credit_floor": h.cfg.Pool.CreditFloor(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -518,6 +531,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st := newChatStat(time.Now(), body, peek.Stream)
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
+		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
+		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
 	defer st.done()
 
@@ -579,10 +595,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	recordAttempt := func(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time) {
 		st.attempts++
-		if hasCredit {
-			st.credit = credit
-			st.hasCredit = true
-		}
 		if delta.HasPromptTokens {
 			st.promptTokens = delta.PromptTokens
 		}
@@ -628,6 +640,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasTotal:         delta.HasTotalTokens,
 				Credit:           credit,
 				HasCredit:        hasCredit,
+				HasCacheTokens:   st.hasCache,
+				CacheHitTokens:   st.cacheHit,
+				CacheMissTokens:  st.cacheMiss,
 				ModelRate:        modelRate,
 				LatencyMs:        delta.LatencyMs,
 				HasLatency:       delta.HasLatencyMs,
@@ -904,7 +919,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeSuccess
 			}
 			credit, hasCredit := stats.Credit()
+			if hit, miss, ok := stats.CacheTokens(); ok {
+				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+			}
 			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted)
+			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
+			if st.hasCache {
+				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -915,6 +937,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if hasCredit {
+				st.credit = credit
+				st.hasCredit = true
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
@@ -933,13 +957,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
+		if usage, ok := resp["usage"].(map[string]any); ok {
+			if hit, okH := upstream.UsageCacheHitTokens(usage); okH {
+				miss, _ := upstream.UsageCacheMissTokens(usage)
+				st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
+			}
+		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted)
+		if st.hasCache {
+			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
+			st.credit = credit
+			st.hasCredit = true
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
 		return
@@ -1118,7 +1153,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
