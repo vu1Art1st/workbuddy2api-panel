@@ -15,6 +15,9 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+/scripts/token_monitor_ua_exporter.json
+/scripts/cobble_token_monitor_exporter.json
+/scripts/artex_mobile_token_monitor_exporter.json
 
 # Build artifacts
 *.tmp

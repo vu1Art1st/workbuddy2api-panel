@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""Collect ARTEX mobile-cloud token usage over SSH and push to Token Monitor."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+import shlex
+from pathlib import Path
+from typing import Any, Iterable
+
+import token_monitor_ua_exporter as tm
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "artex_mobile_token_monitor_exporter.json"
+DEFAULT_STATE_FILE = (
+    REPO_ROOT.parent
+    / "wb2api-panel-windows-amd64"
+    / "data"
+    / "artex-mobile-token-monitor-state.json"
+)
+DEFAULT_PRICING_BINARY = (
+    REPO_ROOT.parent
+    / "Token-Monitor"
+    / "resources"
+    / "app.asar.unpacked"
+    / "node_modules"
+    / "@tokscale"
+    / "cli-win32-x64-msvc"
+    / "bin"
+    / "tokscale.exe"
+)
+STATE_VERSION = 1
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "ssh_host": "10.28.0.131",
+    "ssh_port": 22,
+    "ssh_user": "kali",
+    "ssh_password": "",
+    "ssh_password_env": "ARTEX_SSH_PASSWORD",
+    "ssh_key_file": "",
+    "ssh_timeout_seconds": 10,
+    "remote_dir": "/home/kali/Desktop/ARTEX",
+    "docker_container": "artex-postgres-1",
+    "base_url_like": "%cmecloud.cn/tokenplan/%",
+    "hub_url": "http://127.0.0.1:17321",
+    "state_file": str(DEFAULT_STATE_FILE),
+    "secret_file": r"%APPDATA%\Token Monitor\credentials.json",
+    "device_id": "artex-mobile-cloud",
+    "hostname": "kali",
+    "client_id": "artex-mobile",
+    "interval_seconds": 60,
+    "utc_offset_minutes": 480,
+    "time_zone_name": "Asia/Shanghai",
+    "history_daily_max_days": 370,
+    "payload_max_bytes": 900_000,
+    "http_timeout_seconds": 15,
+    "retry_attempts": 5,
+    "pricing_binary": str(DEFAULT_PRICING_BINARY),
+    "pricing_cache_ttl_seconds": 86400,
+    "pricing_timeout_seconds": 12,
+    "pricing_min_model_tokens": 1000,
+    "pricing_max_lookups_per_run": 8,
+    "pricing_concurrency": 6,
+}
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Collect ARTEX mobile-cloud llm_usage rows over SSH and push to Token Monitor."
+    )
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--state-file", type=Path)
+    parser.add_argument("--ssh-host")
+    parser.add_argument("--ssh-port", type=int)
+    parser.add_argument("--ssh-user")
+    parser.add_argument("--ssh-password")
+    parser.add_argument("--ssh-key-file", type=Path)
+    parser.add_argument("--hub-url")
+    parser.add_argument("--secret-file", type=Path)
+    parser.add_argument("--device-id")
+    parser.add_argument("--interval", type=int)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--print-payload", action="store_true")
+    parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--reset-state", action="store_true")
+    parser.add_argument("--no-pricing", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def resolve_path(value: Any, base: Path) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(str(value or "")))
+    path = Path(expanded)
+    return path if path.is_absolute() else (base / path).resolve()
+
+
+def resolve_optional_path(value: Any, base: Path) -> Path | None:
+    if value in (None, ""):
+        return None
+    return resolve_path(value, base)
+
+
+def load_config(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = args.config
+    if config_path is None and DEFAULT_CONFIG_PATH.exists():
+        config_path = DEFAULT_CONFIG_PATH
+    if config_path is not None:
+        config_path = config_path.expanduser().resolve()
+        if not config_path.exists():
+            raise ConfigError(f"config file does not exist: {config_path}")
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"read config {config_path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ConfigError("config root must be a JSON object")
+        base_dir = config_path.parent
+        config = deep_merge(DEFAULT_CONFIG, raw)
+    else:
+        base_dir = SCRIPT_DIR
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
+    cli_base = Path.cwd()
+    if args.state_file:
+        config["state_file"] = str(resolve_path(args.state_file, cli_base))
+    if args.ssh_host:
+        config["ssh_host"] = args.ssh_host
+    if args.ssh_port is not None:
+        config["ssh_port"] = args.ssh_port
+    if args.ssh_user:
+        config["ssh_user"] = args.ssh_user
+    if args.ssh_password is not None:
+        config["ssh_password"] = args.ssh_password
+    if args.ssh_key_file:
+        config["ssh_key_file"] = str(resolve_path(args.ssh_key_file, cli_base))
+    if args.hub_url:
+        config["hub_url"] = args.hub_url
+    if args.secret_file:
+        config["secret_file"] = str(resolve_path(args.secret_file, cli_base))
+    if args.device_id:
+        config["device_id"] = args.device_id
+    if args.interval is not None:
+        config["interval_seconds"] = args.interval
+    if args.no_pricing:
+        config["pricing_binary"] = ""
+
+    config["state_file"] = str(resolve_path(config["state_file"], base_dir))
+    config["secret_file"] = resolve_optional_path(config.get("secret_file"), base_dir)
+    config["ssh_key_file"] = resolve_optional_path(config.get("ssh_key_file"), base_dir)
+    config["pricing_binary"] = resolve_optional_path(config.get("pricing_binary"), base_dir)
+    config["hub_url"] = str(config.get("hub_url") or DEFAULT_CONFIG["hub_url"]).rstrip("/")
+    config["device_id"] = tm.sanitize_client_name(config.get("device_id")) or "artex-mobile-cloud"
+    config["client_id"] = tm.sanitize_client_name(config.get("client_id")) or "artex-mobile"
+    config["ssh_host"] = str(config.get("ssh_host") or "").strip()
+    config["ssh_user"] = str(config.get("ssh_user") or "").strip()
+    config["ssh_port"] = max(1, int(config.get("ssh_port") or 22))
+    config["ssh_timeout_seconds"] = max(1, int(config.get("ssh_timeout_seconds") or 10))
+    config["interval_seconds"] = max(1, int(config.get("interval_seconds") or 60))
+    config["utc_offset_minutes"] = int(config.get("utc_offset_minutes") or 0)
+    config["time_zone_name"] = str(config.get("time_zone_name") or "UTC+08:00")
+    config["history_daily_max_days"] = max(1, int(config.get("history_daily_max_days") or 370))
+    config["payload_max_bytes"] = max(1024, int(config.get("payload_max_bytes") or 900_000))
+    config["http_timeout_seconds"] = max(1, int(config.get("http_timeout_seconds") or 15))
+    config["retry_attempts"] = max(1, int(config.get("retry_attempts") or 5))
+    config["pricing_cache_ttl_seconds"] = max(
+        0, int(config.get("pricing_cache_ttl_seconds") or 0)
+    )
+    config["pricing_timeout_seconds"] = max(
+        1, int(config.get("pricing_timeout_seconds") or 12)
+    )
+    config["pricing_min_model_tokens"] = max(
+        0, int(config.get("pricing_min_model_tokens") or 0)
+    )
+    config["pricing_max_lookups_per_run"] = max(
+        0, int(config.get("pricing_max_lookups_per_run") or 0)
+    )
+    config["pricing_concurrency"] = max(
+        1, int(config.get("pricing_concurrency") or 6)
+    )
+    if not config["ssh_host"]:
+        raise ConfigError("ssh_host is required")
+    if not config["ssh_user"]:
+        raise ConfigError("ssh_user is required")
+    if not config.get("remote_dir"):
+        raise ConfigError("remote_dir is required")
+    return config
+
+
+def ssh_password(config: dict[str, Any]) -> str:
+    value = str(config.get("ssh_password") or "")
+    if value:
+        return value
+    env_name = str(config.get("ssh_password_env") or "ARTEX_SSH_PASSWORD")
+    return os.environ.get(env_name, "").strip()
+
+
+def connect_ssh(config: dict[str, Any]) -> Any:
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise ConfigError("paramiko is required for SSH collection") from exc
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs: dict[str, Any] = {
+        "hostname": config["ssh_host"],
+        "port": int(config["ssh_port"]),
+        "username": config["ssh_user"],
+        "timeout": int(config["ssh_timeout_seconds"]),
+        "banner_timeout": int(config["ssh_timeout_seconds"]),
+        "auth_timeout": int(config["ssh_timeout_seconds"]),
+        "look_for_keys": not bool(config.get("ssh_key_file")),
+        "allow_agent": False,
+    }
+    if config.get("ssh_key_file"):
+        kwargs["key_filename"] = str(config["ssh_key_file"])
+        password = ssh_password(config)
+        if password:
+            kwargs["passphrase"] = password
+    else:
+        password = ssh_password(config)
+        if not password:
+            raise ConfigError(
+                f"SSH password is empty; set config.ssh_password or env "
+                f"{config.get('ssh_password_env') or 'ARTEX_SSH_PASSWORD'}"
+            )
+        kwargs["password"] = password
+    client.connect(**kwargs)
+    return client
+
+
+def remote_query(config: dict[str, Any], last_id: int) -> list[dict[str, Any]]:
+    password = ssh_password(config)
+    sql = f"""
+SELECT json_build_object(
+  'id', u.id,
+  'ts', to_char(u.ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+  'task_id', COALESCE(u.task_id, ''),
+  'exploration_id', COALESCE(u.exploration_id, 0),
+  'worker', COALESCE(u.worker, ''),
+  'model', COALESCE(u.model, ''),
+  'profile_name', COALESCE(u.profile_name, ''),
+  'latency_ms', COALESCE(u.latency_ms, 0),
+  'input_tokens', COALESCE(u.input_tokens, 0),
+  'output_tokens', COALESCE(u.output_tokens, 0),
+  'cache_read', COALESCE(u.cache_read, 0),
+  'cache_write', COALESCE(u.cache_write, 0),
+  'status', COALESCE(u.status, '')
+)::text
+FROM llm_usage u
+JOIN llm_profiles p ON p.name = u.profile_name
+WHERE p.base_url LIKE {sql_literal(config['base_url_like'])}
+  AND u.id > {int(last_id)}
+ORDER BY u.id;
+"""
+    remote_dir = shlex.quote(str(config["remote_dir"]))
+    container = shlex.quote(str(config["docker_container"]))
+    command = (
+        f"cd {remote_dir} && set -a && . ./.env && set +a && "
+        f"printf '%s\\n' {shlex.quote(password)} | sudo -S "
+        f"docker exec -e PGPASSWORD=\"$POSTGRES_PASSWORD\" {container} "
+        f"psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -At "
+        f"-c {shlex.quote(sql.strip())}"
+    )
+    client = connect_ssh(config)
+    try:
+        _, stdout, stderr = client.exec_command(command, timeout=60)
+        output = stdout.read().decode("utf-8", "replace")
+        error = stderr.read().decode("utf-8", "replace")
+    finally:
+        client.close()
+    if error.strip():
+        clean = "\n".join(
+            line for line in error.splitlines()
+            if "[sudo]" not in line and line.strip() != "Password:"
+        ).strip()
+        if clean:
+            print(f"[artex-export] remote stderr: {clean[:1000]}", file=sys.stderr)
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"invalid remote JSON row: {exc}: {line[:200]}") from exc
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def sql_literal(value: Any) -> str:
+    return "'" + str(value or "").replace("'", "''") + "'"
+
+
+def normalize_model(value: Any) -> str:
+    return str(value or "").strip().lower() or "unknown"
+
+
+def add_artex_record(period: dict[str, Any], row: dict[str, Any], client: str) -> bool:
+    input_tokens = max(0, int(row.get("input_tokens") or 0))
+    output_tokens = max(0, int(row.get("output_tokens") or 0))
+    total = input_tokens + output_tokens
+    if total <= 0:
+        return False
+    cache_read = min(input_tokens, max(0, int(row.get("cache_read") or 0)))
+    cache_write = min(
+        input_tokens - cache_read,
+        max(0, int(row.get("cache_write") or 0)),
+    )
+    output = min(output_tokens, total)
+    # Mobile Cloud is OpenAI-format: input_tokens includes cache read/write,
+    # and Token Monitor derives the remaining input cache miss.
+    unclassified = 0
+    model = normalize_model(row.get("model"))
+    duration_ms = max(0, int(row.get("latency_ms") or 0))
+
+    period["totalTokens"] += total
+    period["cacheReadTokens"] += cache_read
+    period["cacheWriteTokens"] += cache_write
+    period["outputTokens"] += output
+    period["unclassifiedTokens"] += unclassified
+    period["timedTokens"] += total
+    period["timedOutputTokens"] += output
+    period["timedDurationMs"] += duration_ms
+    period["messageCount"] += 1
+
+    tm.add_number_map(period["clients"], {client: total})
+    tm.add_number_map(period["clientMessages"], {client: 1})
+    tm.add_number_map(period["clientCacheReads"], {client: cache_read})
+    tm.add_number_map(period["clientCacheWrites"], {client: cache_write})
+    tm.add_number_map(period["clientOutputs"], {client: output})
+    tm.add_number_map(period["clientUnclassifiedTokens"], {client: unclassified})
+
+    tm.add_number_map(period["models"], {model: total})
+    tm.add_number_map(period["modelCacheReads"], {model: cache_read})
+    tm.add_number_map(period["modelCacheWrites"], {model: cache_write})
+    tm.add_number_map(period["modelOutputs"], {model: output})
+    tm.add_number_map(period["modelUnclassifiedTokens"], {model: unclassified})
+    tm.add_number_map(period["clientModels"].setdefault(client, {}), {model: total})
+    return True
+
+
+def empty_state() -> dict[str, Any]:
+    return {
+        "version": STATE_VERSION,
+        "last_id": 0,
+        "days": {},
+        "pricing": {},
+        "updatedAt": "",
+    }
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return empty_state()
+    try:
+        state = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"read state {path}: {exc}") from exc
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
+        raise ConfigError(f"unsupported state version in {path}")
+    if not isinstance(state.get("last_id"), int):
+        state["last_id"] = int(state.get("last_id") or 0)
+    if not isinstance(state.get("days"), dict):
+        state["days"] = {}
+    if not isinstance(state.get("pricing"), dict):
+        state["pricing"] = {}
+    return state
+
+
+def save_state(path: Path, state: dict[str, Any], now: dt.datetime) -> None:
+    state["version"] = STATE_VERSION
+    state["updatedAt"] = tm.iso_z(now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(state, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
+def ingest_rows(
+    state: dict[str, Any],
+    rows: Iterable[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, int]:
+    stats = {"rows": 0, "new": 0, "ignored": 0, "bad_time": 0, "max_id": int(state["last_id"])}
+    days = state["days"]
+    client = config["client_id"]
+    offset = int(config["utc_offset_minutes"])
+    for row in rows:
+        if not isinstance(row, dict):
+            stats["ignored"] += 1
+            continue
+        stats["rows"] += 1
+        try:
+            row_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            stats["ignored"] += 1
+            continue
+        if row_id <= int(state["last_id"]):
+            stats["ignored"] += 1
+            continue
+        stats["max_id"] = max(stats["max_id"], row_id)
+        instant = tm.parse_log_time(row.get("ts"), offset)
+        if instant is None:
+            stats["bad_time"] += 1
+            continue
+        day = tm.local_date_key(instant, offset)
+        period = days.setdefault(day, tm.empty_period())
+        if not add_artex_record(period, row, client):
+            stats["ignored"] += 1
+            continue
+        stats["new"] += 1
+    state["last_id"] = max(int(state["last_id"]), int(stats["max_id"]))
+    return stats
+
+
+def collect_model_totals(state: dict[str, Any]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for period in state["days"].values():
+        for model, tokens in period.get("models", {}).items():
+            totals[str(model)] = totals.get(str(model), 0) + int(tokens)
+    return totals
+
+
+def aggregate_days(
+    days: dict[str, dict[str, Any]],
+    predicate: Any = None,
+) -> dict[str, Any]:
+    result = tm.empty_period()
+    for day, period in days.items():
+        if predicate is not None and not predicate(day):
+            continue
+        tm.add_period(result, period)
+    return result
+
+
+def build_payload(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    now: dt.datetime,
+    rates_by_model: dict[str, dict[str, float]] | None = None,
+) -> dict[str, Any]:
+    offset = int(config["utc_offset_minutes"])
+    windows = tm.period_windows(now, offset, str(config["time_zone_name"]))
+    days = state["days"]
+    today_key = windows["today"]["key"]
+    month_prefix = windows["month"]["key"]
+    today_period = days.get(today_key, tm.empty_period())
+    month_period = aggregate_days(days, lambda day: day.startswith(month_prefix))
+    all_time = aggregate_days(days)
+    clients = sorted(all_time.get("clients", {}))
+    payload = {
+        "deviceId": config["device_id"],
+        "hostname": str(config.get("hostname") or config.get("ssh_host") or socket.gethostname()),
+        "platform": "linux-x86_64",
+        "agentVersion": "1.0.0",
+        "agentRuntime": "artex-ssh-collector",
+        "updatedAt": tm.iso_z(now),
+        "trackedClients": clients,
+        "clientStatus": {client: "active" for client in clients},
+        "projectsEnabled": False,
+        "historyAvailable": True,
+        "history": tm.build_history(
+            days,
+            windows,
+            int(config["history_daily_max_days"]),
+            rates_by_model,
+        ),
+        "periodWindows": windows,
+        "periods": {
+            "today": tm.period_to_payload(today_period, rates_by_model),
+            "month": tm.period_to_payload(month_period, rates_by_model),
+            "allTime": tm.period_to_payload(all_time, rates_by_model),
+        },
+    }
+    return tm.fit_payload(payload, int(config["payload_max_bytes"]))
+
+
+def run_cycle(config: dict[str, Any], args: argparse.Namespace) -> int:
+    state_path = Path(config["state_file"])
+    if args.rebuild:
+        previous = load_state(state_path) if state_path.exists() else empty_state()
+        state = empty_state()
+        state["pricing"] = previous.get("pricing", {})
+    else:
+        state = load_state(state_path)
+
+    rows = remote_query(config, int(state["last_id"]))
+    stats = ingest_rows(state, rows, config)
+    now = dt.datetime.now(dt.timezone.utc)
+    model_totals = collect_model_totals(state)
+    models_by_volume = [
+        model
+        for model, _ in sorted(model_totals.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    provider = tm.PricingProvider(
+        config,
+        state.setdefault("pricing", {}),
+        now,
+        log_prefix="[artex-export]",
+    )
+    rates_by_model = provider.resolve_models(models_by_volume, model_totals)
+    payload = build_payload(state, config, now, rates_by_model)
+
+    commit = not (args.dry_run or args.print_payload)
+    if commit:
+        save_state(state_path, state, now)
+
+    totals = payload["periods"]["allTime"]
+    if args.print_payload:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            "[artex-export] "
+            f"rows={stats['rows']} new={stats['new']} ignored={stats['ignored']} "
+            f"bad_time={stats['bad_time']} last_id={state['last_id']} "
+            f"clients={len(payload['trackedClients'])} "
+            f"allTimeTokens={totals['totalTokens']} "
+            f"allTimeCostUsd={totals['costUsd']:.6f}",
+            flush=True,
+        )
+
+    if args.dry_run or args.print_payload:
+        return 0
+
+    secret = tm.read_secret(config)
+    result = tm.push_with_retry(config, payload, secret)
+    print(
+        f"[artex-export] pushed device={result.get('deviceId', config['device_id'])} "
+        f"bytes={tm.payload_size(payload)}",
+        flush=True,
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        config = load_config(args)
+    except ConfigError as exc:
+        print(f"[artex-export] error: {exc}", file=sys.stderr)
+        return 2
+
+    lock_handle = None
+    try:
+        if not (args.dry_run or args.print_payload):
+            lock_handle = tm.acquire_lock(Path(config["state_file"]))
+        if args.reset_state:
+            state_path = Path(config["state_file"])
+            try:
+                state_path.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"[artex-export] reset state {state_path}", flush=True)
+            return 0
+
+        while True:
+            try:
+                run_cycle(config, args)
+            except tm.PushAuthError as exc:
+                print(f"[artex-export] error: {exc}", file=sys.stderr)
+                return 3
+            except (ConfigError, tm.PushPayloadError, tm.PushRetryError, OSError) as exc:
+                print(f"[artex-export] error: {exc}", file=sys.stderr)
+                if args.once:
+                    return 1
+            if args.once:
+                return 0
+            time.sleep(int(config["interval_seconds"]))
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
