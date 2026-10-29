@@ -1,0 +1,32 @@
+{
+  "ssh_host": "10.28.0.132",
+  "ssh_port": 22,
+  "ssh_user": "xue",
+  "ssh_password": "",
+  "ssh_password_env": "COBBLE_SSH_PASSWORD",
+  "ssh_key_file": "",
+  "ssh_timeout_seconds": 10,
+  "remote_globs": [
+    "/home/xue/Cobble/data/model-calls/model-calls.jsonl",
+    "/home/xue/Cobble/runs/*/data/model-calls/model-calls.jsonl"
+  ],
+  "hub_url": "http://127.0.0.1:17321",
+  "state_file": "../../wb2api-panel-windows-amd64/data/cobble-token-monitor-state.json",
+  "secret_file": "%APPDATA%/Token Monitor/credentials.json",
+  "device_id": "cobble-vm",
+  "hostname": "xue",
+  "client_id": "cobble",
+  "interval_seconds": 60,
+  "utc_offset_minutes": 480,
+  "time_zone_name": "Asia/Shanghai",
+  "history_daily_max_days": 370,
+  "payload_max_bytes": 900000,
+  "http_timeout_seconds": 15,
+  "retry_attempts": 5,
+  "pricing_binary": "../../Token-Monitor/resources/app.asar.unpacked/node_modules/@tokscale/cli-win32-x64-msvc/bin/tokscale.exe",
+  "pricing_cache_ttl_seconds": 86400,
+  "pricing_timeout_seconds": 12,
+  "pricing_min_model_tokens": 1000,
+  "pricing_max_lookups_per_run": 8,
+  "pricing_concurrency": 6
+}
