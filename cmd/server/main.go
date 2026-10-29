@@ -7,9 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,6 +49,21 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("fatal: %v", err)
+		showFatalError("WorkBuddy2API 启动失败", err.Error())
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	logs, err := newLogSinks()
+	if err != nil {
+		return fmt.Errorf("初始化日志: %w", err)
+	}
+	defer logs.Close()
+	logs.init()
+
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
@@ -69,13 +84,27 @@ func main() {
 			}
 		}
 		if err != nil {
-			log.Fatalf("load config: %v", err)
+			return fmt.Errorf("load config: %w", err)
 		}
 	}
 
+	instance, duplicate, err := acquireSingleInstance()
+	if err != nil {
+		return err
+	}
+	if duplicate {
+		url := panelURL(cfg.Listen)
+		log.Printf("已有实例正在运行，打开管理面板 %s", url)
+		if err := openPanelInBrowser(url); err != nil {
+			return err
+		}
+		return nil
+	}
+	defer instance.Close()
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
-		log.Fatalf("load auths: %v", err)
+		return fmt.Errorf("load auths: %w", err)
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
@@ -324,8 +353,7 @@ func main() {
 	// 清扫回调返回统计汇总（测试/日志可观测），调度器 hook 只要求 func()：
 	// 这里收掉返回值——汇总已由 panel 侧内部日志输出。
 	sch.SetTaskSweepHook(func() { pn.RunTaskSweepOnce() })
-	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
-	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+	logs.attachPanel(pn)
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -351,8 +379,10 @@ func main() {
 		ModelsHidden: cfg.Models.Hidden,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(baseCtx)
+	defer cancel()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
@@ -380,19 +410,48 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
+	}
+
+	var serveErr error
+	serveDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		serveErr = srv.Serve(listener)
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = nil
+		}
+		close(serveDone)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+			cancel()
+		}
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	desktopErr := runDesktop(ctx, func() {
+		if err := openPanelInBrowser(panelURL(cfg.Listen)); err != nil {
+			log.Printf("打开管理面板失败: %v", err)
+		}
+	})
+	cancel()
+	p.Flush() // 托盘退出/信号触发：先落盘再做优雅停机
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = srv.Shutdown(shutdownCtx)
+	shutdownCancel()
+	<-serveDone
+	if desktopErr != nil {
+		return desktopErr
+	}
+	if serveErr != nil {
+		return fmt.Errorf("http: %w", serveErr)
 	}
 	log.Printf("bye")
+	return nil
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
