@@ -119,3 +119,33 @@ func TestSetAppearanceTheme(t *testing.T) {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
 	}
 }
+
+func TestMarketExpertSearchSendsKeyword(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/portal/operation-platform/market/expert/list" {
+			t.Errorf("path=%q", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{"experts":[{"expert_id":"ex_xQHHD1u5Jkua","expert_type":"agent","display_name_zh":"无畏契约拼豆专家","version":"1.3.1"}]}}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	experts, err := c.MarketExpertSearch(&auth.Auth{UID: "u1", AccessToken: "at"}, "agent", "无畏契约拼豆专家")
+	if err != nil {
+		t.Fatalf("MarketExpertSearch: %v", err)
+	}
+	if got := body["keyword"]; got != "无畏契约拼豆专家" {
+		t.Errorf("keyword=%v", got)
+	}
+	if got := body["expert_type"]; got != "agent" {
+		t.Errorf("expert_type=%v", got)
+	}
+	if len(experts) != 1 || experts[0].ExpertID != "ex_xQHHD1u5Jkua" {
+		t.Fatalf("experts=%+v", experts)
+	}
+}

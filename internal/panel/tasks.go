@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -52,7 +53,17 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks})
+	starbucks, inPeriod, sbErr := p.accountStarbucksTasks(a)
+	resp := map[string]any{
+		"ok":                  true,
+		"tasks":               tasks,
+		"starbucks":           starbucks,
+		"starbucks_in_period": inPeriod,
+	}
+	if sbErr != nil {
+		resp["starbucks_error"] = sbErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // accountTaskAccept 接受任务（报名；幂等）。
@@ -158,9 +169,38 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		TaskCode string `json:"task_code"`
+		Source   string `json:"source"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
+		return
+	}
+	source := strings.TrimSpace(body.Source)
+	if source == "" {
+		source = "growth"
+	}
+	unlock, ok := p.lockTaskMutation()
+	if !ok {
+		writeErr(w, http.StatusConflict, "另一个任务正在执行，请等本轮结束后再试")
+		return
+	}
+	defer unlock()
+	if source == "starbucks" {
+		credit, chance, claimed, msg, err := p.claimStarbucksTask(a, body.TaskCode)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
+			return
+		}
+		log.Printf("panel: 星巴克领奖 uid=%s code=%s credit=%d chance=%d claimed=%v", uid, body.TaskCode, credit, chance, claimed)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "source": "starbucks", "claimed": claimed,
+			"credit": credit, "reward_chance": chance,
+			"message": msg,
+		})
+		return
+	}
+	if source != "growth" {
+		writeErr(w, http.StatusBadRequest, "unsupported task source")
 		return
 	}
 	// 小程序口径任务走 chat 域 mp 头领奖（缺头实测不可领）；其余 Web 端接口。

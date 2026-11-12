@@ -3,9 +3,11 @@
 //
 // 语义：
 //   - 扫描（scan_all）：并发拉取每账号的成长任务列表（默认+小程序口径），
-//     汇总出"未完成且可自动化"的待办清单（只读，不执行）。
+//     汇总出全部"未领取且未锁定"的待办清单（只读，不执行）；同时标注是否
+//     有自动动作，供前端区分"待执行"与"需手动"。
 //   - 执行队列（run_queue + queue）：把待办项按账号分组排队执行——账号内
-//     串行（复用 per-account 锁，与单任务/一键完成互斥），账号间并发
+//     串行（复用 per-account 锁，与单任务/一键完成互斥），仅入队可自动任务，
+//     账号间并发
 //     （concurrency 信号量限制，默认 1）。队列状态可轮询。
 package panel
 
@@ -28,13 +30,25 @@ import (
 
 // scanAccountItem 单账号扫描结果。
 type scanAccountItem struct {
-	UID       string          `json:"uid"`
-	Nickname  string          `json:"nickname"`
-	Growth    []upstream.Task `json:"growth,omitempty"`
-	GrowthErr string          `json:"growth_error,omitempty"`
+	UID          string              `json:"uid"`
+	Nickname     string              `json:"nickname"`
+	Growth       []scanTaskView      `json:"growth,omitempty"`
+	GrowthErr    string              `json:"growth_error,omitempty"`
+	Starbucks    []scanStarbucksView `json:"starbucks,omitempty"`
+	StarbucksErr string              `json:"starbucks_error,omitempty"`
 }
 
-// growthPending 任务是否"未完成且可自动化"。
+// scanTaskView 扫描结果中的成长任务。内嵌上游任务字段以保持既有响应兼容，
+// Executable 用于区分可排队执行与只能在官方客户端手动完成。
+type scanTaskView struct {
+	upstream.Task
+	Executable bool   `json:"executable"`
+	Action     string `json:"action,omitempty"`
+}
+
+// growthPending 任务是否仍是待办。这里不能要求任务在 autoActions 白名单里：
+// 上游会持续下发新活动任务（如 expert_use_douyinyin），白名单只表示"能否
+// 自动执行"，不能拿来判断"是否存在待办"。
 func growthPending(t upstream.Task) bool {
 	if t.Claimed {
 		return false
@@ -46,19 +60,67 @@ func growthPending(t upstream.Task) bool {
 	if t.Locked {
 		return false
 	}
-	if t.Target > 0 && t.Current >= t.Target {
-		// 达标未领：也入队（队列执行后会自动领）——但仅限有自动化动作的任务，
-		// 否则队列执行时会因 autoActionFor 为 nil 直接报错。
-		return autoActionFor(t.TaskCode) != nil
-	}
-	return autoActionFor(t.TaskCode) != nil
+	return true
 }
 
-// tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
+// growthAuto 任务是否可进入自动执行队列。扫描展示与队列执行必须分开：
+// 新活动任务即使暂无自动动作，也要作为待办展示，不能从扫描结果中消失。
+func growthAuto(t upstream.Task) bool {
+	act := autoActionFor(t.TaskCode)
+	return growthPending(t) && act != nil && !act.ManualOnly
+}
+
+// scanTaskFor 把上游任务转为扫描视图，并带上自动执行能力与动作说明。
+func scanTaskFor(t upstream.Task) scanTaskView {
+	act := autoActionFor(t.TaskCode)
+	v := scanTaskView{Task: t, Executable: act != nil && !act.ManualOnly}
+	if act != nil {
+		v.Action = act.Desc
+	} else {
+		v.Action = "需在官方客户端或活动页手动完成"
+	}
+	return v
+}
+
+// scanStarbucksView 星巴克活动的扫描视图。活动任务只从单账号任务列表手动
+// 执行/领奖，不进入自动队列。
+type scanStarbucksView struct {
+	upstream.StarbucksTask
+	Executable bool   `json:"executable"`
+	Action     string `json:"action,omitempty"`
+}
+
+func starbucksPending(t upstream.StarbucksTask) bool {
+	return !t.Claimed && !t.Locked
+}
+
+func scanStarbucksFor(t upstream.StarbucksTask) scanStarbucksView {
+	v := scanStarbucksView{StarbucksTask: t}
+	switch {
+	case t.Claimed:
+		v.Action = "奖励已领取"
+	case t.Locked:
+		v.Action = "活动任务暂未开放"
+	case t.Completed:
+		v.Action = "已完成，请在账号任务列表手动领奖"
+	default:
+		v.Action = "请在账号任务列表单独执行"
+	}
+	return v
+}
+
+// tasksScanAll 扫描全部账号：成长任务（未领取且未锁定，含 mp 口径合并）。
 // 只读操作，并发拉取（账号数个位数）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
+	starbucksOpen := false
+	var starbucksConfigErr error
+	if sbCfg, err := p.cfg.Upstream.StarbucksConfig(); err != nil {
+		starbucksConfigErr = err
+	} else {
+		starbucksOpen = sbCfg.InPeriod
+	}
 	var wg sync.WaitGroup
 	for i, st := range states {
 		if st.Disabled {
@@ -87,7 +149,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			} else {
 				for _, t := range tasks {
 					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
+						it.Growth = append(it.Growth, scanTaskFor(t))
 					}
 				}
 			}
@@ -101,19 +163,45 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				}
 				for _, t := range mpTasks {
 					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
+						it.Growth = append(it.Growth, scanTaskFor(t))
 					}
 				}
+			}
+			// 星巴克协作活动是独立的活动任务域，不属于 growth 任务列表。
+			if starbucksOpen {
+				if sbTasks, err := p.cfg.Upstream.StarbucksTasks(a); err != nil {
+					it.StarbucksErr = err.Error()
+				} else {
+					for _, t := range sbTasks {
+						if starbucksPending(t) {
+							it.Starbucks = append(it.Starbucks, scanStarbucksFor(t))
+						}
+					}
+				}
+			} else if starbucksConfigErr != nil {
+				it.StarbucksErr = starbucksConfigErr.Error()
 			}
 		}(i, st.UID)
 	}
 	wg.Wait()
-	pending := 0
+	pending, executable := 0, 0
 	for _, it := range items {
-		pending += len(it.Growth)
+		pending += len(it.Growth) + len(it.Starbucks)
+		for _, t := range it.Growth {
+			if t.Executable {
+				executable++
+			}
+		}
+		for _, t := range it.Starbucks {
+			if t.Executable {
+				executable++
+			}
+		}
 	}
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项（可自动执行 %d 项）", pending, executable)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "accounts": items, "pending_count": pending, "executable_count": executable,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -182,12 +270,8 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 // 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
 // [1,4]；growth 开关同 HTTP 入参语义。
 func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total int, seq int, msg string) {
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if concurrency > 4 {
-		concurrency = 4
-	}
+	// 任务行为事件全局串行，避免跨账号并发被上游判定为批量操作。
+	concurrency = 1
 	q := p.queue()
 	q.mu.Lock()
 	if q.running {
@@ -202,7 +286,6 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
-
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -223,21 +306,15 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				return
 			}
 			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 企业切换会话（token_source=enterprise_switch）同跳：任务列表读得到，
-			// 但执行后行为事件被上游静默丢弃（200 不计分）——每项都是零收益白跑
-			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
-			// auth.IsEnterpriseSession）。
+			// token_source=enterprise_switch 只是登录取证渠道标记，不能替代
+			// enterpriseId 判定账号是否为企业版。
 			if a.IsEnterprise() {
-				return
-			}
-			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
 				return
 			}
 			if growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
-						if growthPending(t) {
+						if growthAuto(t) {
 							one.grow = append(one.grow, t)
 						}
 					}
@@ -250,7 +327,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 							seen[t.TaskCode] = true
 						}
 						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
+							if growthAuto(t) && !seen[t.TaskCode] {
 								one.grow = append(one.grow, t)
 							}
 						}
@@ -277,12 +354,12 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		}
 	}
 	if len(items) == 0 {
-		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
+		log.Printf("panel: 队列启动：无可自动执行待办（全部账号任务已完成或仅剩需手动任务）")
 		q.mu.Lock()
 		q.running = false
 		q.startedAt = time.Time{}
 		q.mu.Unlock()
-		return false, 0, 0, "全部账号没有待办任务"
+		return false, 0, 0, "全部账号没有可自动执行的待办任务"
 	}
 
 	q.mu.Lock()
@@ -327,6 +404,14 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			unlockAction, _, lerr := p.lockTaskExecution(true)
+			if lerr != nil {
+				p.queueSet(q, one.a.UID, func(it *queueItem) {
+					it.Status, it.Message = "error", lerr.Error()
+				})
+				return
+			}
+			defer unlockAction()
 			// per-account 互斥：与单任务/一键完成共用一把锁。
 			if !p.tryLockAccount(one.a.UID) {
 				p.queueSet(q, one.a.UID, func(it *queueItem) {
@@ -358,7 +443,7 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				} else {
 					p.queueMarkAt(i, "done", msg)
 				}
-				time.Sleep(reportGap) // 项间节流
+				time.Sleep(taskActionCooldown + reportGap) // 项间保持跨任务执行间隔
 			}
 		}(one)
 	}

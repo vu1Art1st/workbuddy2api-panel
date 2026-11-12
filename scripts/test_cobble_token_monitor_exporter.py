@@ -14,6 +14,8 @@ def record(
     *,
     prompt: int = 0,
     completion: int = 0,
+    cache_read: int = 0,
+    cache_write: int = 0,
     model: str = "deepseek-v4.1-flash",
     timestamp: str = "2026-10-22T13:43:54Z",
 ) -> dict:
@@ -24,6 +26,8 @@ def record(
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "total_tokens": tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
         "duration_ms": 100,
         "attempts": 1,
     }
@@ -62,6 +66,30 @@ class CobbleExporterTest(unittest.TestCase):
         self.assertEqual(period["outputTokens"], 50)
         self.assertEqual(period["clients"], {"cobble": 200})
         self.assertEqual(period["models"], {"deepseek-v4.1-flash": 200})
+
+    def test_sqlite_cache_components_are_preserved(self) -> None:
+        state = exporter.empty_state()
+        exporter.ingest_records(
+            state,
+            [
+                record(
+                    "cached",
+                    120,
+                    prompt=100,
+                    completion=20,
+                    cache_read=60,
+                    cache_write=10,
+                )
+            ],
+            config(),
+        )
+        period = state["days"]["2026-10-22"]
+        self.assertEqual(period["cacheReadTokens"], 60)
+        self.assertEqual(period["cacheWriteTokens"], 10)
+        self.assertEqual(period["clientCacheReads"], {"cobble": 60})
+        self.assertEqual(period["clientCacheWrites"], {"cobble": 10})
+        self.assertEqual(period["modelCacheReads"], {"deepseek-v4.1-flash": 60})
+        self.assertEqual(period["modelCacheWrites"], {"deepseek-v4.1-flash": 10})
 
     def test_build_payload_contains_cost_and_device_identity(self) -> None:
         state = exporter.empty_state()

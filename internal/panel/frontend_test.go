@@ -193,7 +193,9 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+	// app.js 以 "use strict" 运行；切片测试也必须保持严格模式，否则漏声明的
+	// 赋值会被当成隐式全局变量，浏览器里却会抛 ReferenceError。
+	vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
@@ -814,6 +816,58 @@ process.stdout.write(JSON.stringify({
 	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
+	}
+}
+
+// 主到期图必须跨行使用同一比例尺：最高批次占满轨道，30/300 显示为 10%/100%，
+// 不能像旧实现那样每行都按自身总额各占满一条轨道。
+func TestAppJSExpiryDistributionScale(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry distribution test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const PK_ACCOUNT_COLORS');
+const end = src.indexOf('function renderPackages');
+if (start < 0 || end < 0) throw new Error('expiry distribution functions not found');
+const sink = { innerHTML: '' };
+const ctx = {
+  Date, Math, Number, String, Map, Array, Object, isFinite,
+  fmtTok: n => String(n), esc: s => String(s),
+  $: id => id === 'pkExpiry' ? sink : null,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.renderExpiryDistribution=renderExpiryDistribution; this.expiryRowPct=expiryRowPct;', ctx);
+const day = 86400000, now = 100000;
+ctx.renderExpiryDistribution([
+  { uid: 'small', remain: 30, packages: [
+    { name: 'small-pack', remain: 30, expires_at: now + day },
+  ] },
+  { uid: 'large', remain: 300, packages: [
+    { name: 'large-pack', remain: 300, expires_at: now + 10 * day },
+  ] },
+], now);
+const widths = [...sink.innerHTML.matchAll(/class="pk-expiry-fill" style="width:([0-9.]+)%/g)]
+  .map(m => Number(m[1]));
+process.stdout.write(JSON.stringify({ widths, pct: ctx.expiryRowPct(30, 300) }));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-scale-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry distribution node test failed: %v\n%s", err, out)
+	}
+	const want = `{"widths":[10,100],"pct":10}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry distribution=%s want %s", out, want)
 	}
 }
 
@@ -1518,4 +1572,3 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
-

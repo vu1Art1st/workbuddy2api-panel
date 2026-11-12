@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect ARTEX mobile-cloud token usage over SSH and push to Token Monitor."""
+"""Collect ARTEX LLM token usage over SSH and push to Token Monitor."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ssh_timeout_seconds": 10,
     "remote_dir": "/home/kali/Desktop/ARTEX",
     "docker_container": "artex-postgres-1",
-    "base_url_like": "%cmecloud.cn/tokenplan/%",
+    "profile_names": [],
     "hub_url": "http://127.0.0.1:17321",
     "state_file": str(DEFAULT_STATE_FILE),
     "secret_file": r"%APPDATA%\Token Monitor\credentials.json",
@@ -67,8 +67,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retry_attempts": 5,
     "pricing_binary": str(DEFAULT_PRICING_BINARY),
     "pricing_cache_ttl_seconds": 86400,
+    "pricing_failure_cache_ttl_seconds": 300,
     "pricing_timeout_seconds": 12,
-    "pricing_min_model_tokens": 1000,
+    "pricing_min_model_tokens": 0,
     "pricing_max_lookups_per_run": 8,
     "pricing_concurrency": 6,
 }
@@ -80,7 +81,7 @@ class ConfigError(RuntimeError):
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Collect ARTEX mobile-cloud llm_usage rows over SSH and push to Token Monitor."
+        description="Collect ARTEX llm_usage rows over SSH and push to Token Monitor."
     )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--state-file", type=Path)
@@ -190,6 +191,9 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     config["pricing_cache_ttl_seconds"] = max(
         0, int(config.get("pricing_cache_ttl_seconds") or 0)
     )
+    config["pricing_failure_cache_ttl_seconds"] = max(
+        0, int(config.get("pricing_failure_cache_ttl_seconds") or 0)
+    )
     config["pricing_timeout_seconds"] = max(
         1, int(config.get("pricing_timeout_seconds") or 12)
     )
@@ -255,6 +259,12 @@ def connect_ssh(config: dict[str, Any]) -> Any:
 
 def remote_query(config: dict[str, Any], last_id: int) -> list[dict[str, Any]]:
     password = ssh_password(config)
+    filters = [f"u.id > {int(last_id)}"]
+    profile_names = config.get("profile_names") or []
+    if profile_names:
+        quoted_profiles = ", ".join(sql_literal(name) for name in profile_names)
+        filters.append(f"u.profile_name IN ({quoted_profiles})")
+    where_clause = "\n  AND ".join(filters)
     sql = f"""
 SELECT json_build_object(
   'id', u.id,
@@ -272,9 +282,7 @@ SELECT json_build_object(
   'status', COALESCE(u.status, '')
 )::text
 FROM llm_usage u
-JOIN llm_profiles p ON p.name = u.profile_name
-WHERE p.base_url LIKE {sql_literal(config['base_url_like'])}
-  AND u.id > {int(last_id)}
+WHERE {where_clause}
 ORDER BY u.id;
 """
     remote_dir = shlex.quote(str(config["remote_dir"]))

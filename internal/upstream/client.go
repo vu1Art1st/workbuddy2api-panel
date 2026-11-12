@@ -768,6 +768,8 @@ type Client struct {
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
+	// OpenPlatformBaseCN 开放平台域（自定义技能分享渠道）。
+	OpenPlatformBaseCN string
 
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
@@ -803,11 +805,12 @@ type CreditObserver func(uid string, credits int64)
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:    "https://copilot.tencent.com",
-		BillingBaseCN: "https://www.codebuddy.cn",
-		WebBaseCN:     "https://www.workbuddy.cn",
+		HTTP:               &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:           &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:         "https://copilot.tencent.com",
+		BillingBaseCN:      "https://www.codebuddy.cn",
+		WebBaseCN:          "https://www.workbuddy.cn",
+		OpenPlatformBaseCN: "https://open.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
@@ -1970,9 +1973,10 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
-	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
-	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
+	// EndTime 该包当前额度的失效时刻：周期包优先 CycleEndTime（当前周期结束即
+	// 月度/周期刷新点）；非周期包优先 DeductionEndTime（可抵扣窗口结束），缺失
+	// 依次回落 ExpiredTime / PackageEndTime / CycleEndTime。RFC3339 或上游墙钟
+	// 字符串，前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
@@ -1989,7 +1993,7 @@ type CreditPackage struct {
 	Cycle bool `json:"cycle,omitempty"`
 }
 
-// ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
+// ExpiryBucket 单个自然日到期的积分合计（按当前额度有效失效时刻聚合）。
 // 面板首页「积分到期提醒」快照与「检查」（逐包明细）共用同一口径：
 //   - Date 为该日（UTC+8，YYYY-MM-DD），前端按这个日期分组展示；
 //   - ExpireAt 是该日最早一批的精确时刻，供「最早到期优先」选号路由使用；
@@ -2000,11 +2004,18 @@ type ExpiryBucket struct {
 	Remain   int64     `json:"remain"`
 }
 
-// packageEffectiveEnd 返回套餐的真实失效时刻：DeductionEndTime（可抵扣窗口结束，
-// epoch 毫秒）优先，缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
-// 与 CreditPackages 的字段优先级必须一致——快照与逐包明细两条路径口径分叉过一次
-// （快照把体验版的周期重置日 10-31 当成到期日，实际 DeductionEndTime 在 2035 年）。
-func packageEffectiveEnd(deductionEndMS int64, expired, packageEnd, cycleEnd string) (time.Time, bool) {
+// packageEffectiveEnd 返回套餐**当前额度**的失效时刻。周期包（CycleCapacitySize > 0）
+// 的月度/周期额度会在 CycleEndTime 刷新，未用完部分随之作废，故它优先于
+// DeductionEndTime；后者是订阅整体可抵扣窗口的结束，可能是数年后的合同期限。
+// 非周期包仍优先 DeductionEndTime，再回落 ExpiredTime / PackageEndTime / CycleEndTime。
+// CreditPackages 与 UserResourceSnapshot 必须共用本函数，避免图表、首页卡片和
+// 「优先消耗快过期积分」路由出现口径分叉。
+func packageEffectiveEnd(cycle bool, deductionEndMS int64, expired, packageEnd, cycleEnd string) (time.Time, bool) {
+	if cycle {
+		if t, ok := parsePackageEndTime(cycleEnd); ok {
+			return t, true
+		}
+	}
 	if deductionEndMS > 0 {
 		return time.UnixMilli(deductionEndMS).In(softRateResetLoc), true
 	}
@@ -2092,7 +2103,8 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		case p.CycleEndTime != "":
 			cp.EndTime = p.CycleEndTime
 		}
-		if end, ok := packageEffectiveEnd(p.DeductionEndTime, p.ExpiredTime, p.PackageEndTime, p.CycleEndTime); ok {
+		cycle := p.CycleCapacitySize > 0
+		if end, ok := packageEffectiveEnd(cycle, p.DeductionEndTime, p.ExpiredTime, p.PackageEndTime, p.CycleEndTime); ok {
 			cp.EndTime = end.Format(time.RFC3339)
 			cp.ExpiresAt = end.UnixMilli()
 		}
@@ -2100,7 +2112,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		if p.CreateTime > 0 {
 			cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
 		}
-		if p.CycleCapacitySize > 0 {
+		if cycle {
 			cp.Cycle = true
 			cp.Remain, cp.Size = p.CycleCapacityRemain, p.CycleCapacitySize
 			cp.Used = cp.Size - cp.Remain
@@ -2272,9 +2284,9 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 // 到期批次（buckets）。日期/剩余量口径与面板「检查」（CreditPackages 前端按日汇总）
 // 完全一致，首页快照据此可零上游请求渲染出同样的内容。
 //
-// 关键：到期时刻统一走 packageEffectiveEnd（DeductionEndTime 优先）。此前本函数只读
-// CycleEndTime，把「个人体验版」的月度周期重置日（如 2026-10-31）当成了到期日，而它
-// 真实的可抵扣窗口到 2034/2035 年——首页快照因此长期错报最近到期时间与数量。
+// 关键：到期时刻统一走 packageEffectiveEnd。周期包取 CycleEndTime，当前月度
+// 额度的刷新/作废日就是 30 天尺度；DeductionEndTime 是订阅合同可抵扣期限，
+// 可长达数年，不能直接用于「这批积分何时到期」。
 func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
@@ -2353,7 +2365,8 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 		if r <= 0 {
 			continue
 		}
-		end, ok := packageEffectiveEnd(acct.DeductionEndTime, acct.ExpiredTime, acct.PackageEndTime, acct.CycleEndTime)
+		cycle := acct.CycleCapacitySize > 0
+		end, ok := packageEffectiveEnd(cycle, acct.DeductionEndTime, acct.ExpiredTime, acct.PackageEndTime, acct.CycleEndTime)
 		if !ok || !end.After(now) {
 			continue
 		}

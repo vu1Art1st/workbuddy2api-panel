@@ -10,6 +10,11 @@
     "/home/xue/Cobble/data/model-calls/model-calls.jsonl",
     "/home/xue/Cobble/runs/*/data/model-calls/model-calls.jsonl"
   ],
+  "remote_sqlite_globs": [
+    "/home/xue/Cobble/control-plane/data/cairnre.sqlite3",
+    "/home/xue/Cobble/task/*/data/cairnre.sqlite3",
+    "/home/xue/Cobble-worktrees/*/control-plane/data/cairnre.sqlite3"
+  ],
   "hub_url": "http://127.0.0.1:17321",
   "state_file": "../../wb2api-panel-windows-amd64/data/cobble-token-monitor-state.json",
   "secret_file": "%APPDATA%/Token Monitor/credentials.json",
@@ -25,8 +30,9 @@
   "retry_attempts": 5,
   "pricing_binary": "../../Token-Monitor/resources/app.asar.unpacked/node_modules/@tokscale/cli-win32-x64-msvc/bin/tokscale.exe",
   "pricing_cache_ttl_seconds": 86400,
+  "pricing_failure_cache_ttl_seconds": 300,
   "pricing_timeout_seconds": 12,
-  "pricing_min_model_tokens": 1000,
+  "pricing_min_model_tokens": 0,
   "pricing_max_lookups_per_run": 8,
   "pricing_concurrency": 6
 }

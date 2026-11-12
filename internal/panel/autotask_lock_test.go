@@ -2,6 +2,7 @@ package panel
 
 import (
 	"testing"
+	"time"
 )
 
 // TestTaskAccountLockSameAccountExclusive 同一账号的任务锁互斥：第二次 tryLock 必须失败，
@@ -49,4 +50,43 @@ func TestTaskAccountLockCrossEntryShared(t *testing.T) {
 		t.Fatal("同 uid 跨入口加锁应失败（共用锁）")
 	}
 	p.unlockAccount("u1")
+}
+
+// TestTaskExecutionGlobalLock 所有账号共用一个执行闸门；即使账号不同也不能并发。
+func TestTaskExecutionGlobalLock(t *testing.T) {
+	old := taskActionCooldown
+	taskActionCooldown = 0
+	t.Cleanup(func() { taskActionCooldown = old })
+
+	p := &Panel{}
+	unlock, _, err := p.lockTaskExecution(false)
+	if err != nil {
+		t.Fatalf("首次获取全局执行闸门: %v", err)
+	}
+	if _, _, err := p.lockTaskExecution(false); err == nil {
+		t.Fatal("全局闸门被占用时第二次执行必须失败")
+	}
+	unlock()
+	unlock2, _, err := p.lockTaskExecution(false)
+	if err != nil {
+		t.Fatalf("释放后应可再次获取: %v", err)
+	}
+	unlock2()
+}
+
+// TestTaskExecutionCooldown 两次任务执行开始之间必须满足冷却。
+func TestTaskExecutionCooldown(t *testing.T) {
+	old := taskActionCooldown
+	taskActionCooldown = time.Hour
+	t.Cleanup(func() { taskActionCooldown = old })
+
+	p := &Panel{}
+	unlock, _, err := p.lockTaskExecution(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if _, _, err := p.lockTaskExecution(false); err == nil {
+		t.Fatal("冷却期内第二次执行必须失败")
+	}
 }

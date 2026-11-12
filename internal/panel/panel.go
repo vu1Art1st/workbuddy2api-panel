@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -91,9 +92,49 @@ type Panel struct {
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
 
+	// taskActionMu 是全局任务写操作闸门：同一时刻只允许一个执行/领奖请求。
+	// taskActionLastAt 只在持锁时读写，用于两次“执行”之间保留最小间隔，
+	// 避免跨账号连续触发被上游判定为异常；领奖不受该冷却限制。
+	taskActionMu     sync.Mutex
+	taskActionLastAt time.Time
+
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+}
+
+// taskActionCooldown 两次任务执行的最小间隔。测试可临时置零。
+var taskActionCooldown = 5 * time.Second
+
+// lockTaskExecution 获取全局执行闸门。wait=false 时并发或冷却中立即失败；
+// wait=true 时等待前一个动作并补足最小间隔，供后台队列串行使用。
+func (p *Panel) lockTaskExecution(wait bool) (unlock func(), retryAfter time.Duration, err error) {
+	if wait {
+		p.taskActionMu.Lock()
+	} else if !p.taskActionMu.TryLock() {
+		return nil, 0, fmt.Errorf("另一个任务正在执行，请等本轮结束后再试")
+	}
+	if !p.taskActionLastAt.IsZero() {
+		remain := taskActionCooldown - time.Since(p.taskActionLastAt)
+		if remain > 0 {
+			if !wait {
+				p.taskActionMu.Unlock()
+				return nil, remain, fmt.Errorf("任务执行间隔过短，请 %.0f 秒后再试", remain.Seconds())
+			}
+			time.Sleep(remain)
+		}
+	}
+	p.taskActionLastAt = time.Now()
+	return p.taskActionMu.Unlock, 0, nil
+}
+
+// lockTaskMutation 获取全局任务写操作闸门，但不施加执行冷却。
+// 领奖等幂等短操作使用；仍会阻止与正在执行的任务并发。
+func (p *Panel) lockTaskMutation() (unlock func(), ok bool) {
+	if !p.taskActionMu.TryLock() {
+		return nil, false
+	}
+	return p.taskActionMu.Unlock, true
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -278,8 +319,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 

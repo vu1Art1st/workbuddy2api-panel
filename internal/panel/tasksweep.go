@@ -124,7 +124,7 @@ func (p *Panel) sweepAccount(a *auth.Auth, uid string) (res sweepResult) {
 	// 混提交会让 mp 任务报 task not found）。
 	var codes, mpCodes []string
 	for _, t := range tasks {
-		if t.Claimed || t.Locked {
+		if t.Claimed || t.Locked || isManualOnlyTask(t.TaskCode) {
 			continue
 		}
 		if t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
@@ -158,7 +158,7 @@ func (p *Panel) sweepAccount(a *auth.Auth, uid string) (res sweepResult) {
 	// 阶段二：领取已达标的奖励。claim 幂等（重复领 already_claimed → 0 分 0 能），
 	// 单项出错只记录、不中断后续任务。
 	for _, t := range tasks {
-		if !t.Claimable {
+		if !t.Claimable || isManualOnlyTask(t.TaskCode) {
 			continue
 		}
 		// mp 口径任务必须走 mp 变体领奖端点（缺 mp 头上游返回 task not found）；

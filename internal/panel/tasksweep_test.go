@@ -159,6 +159,27 @@ func TestTaskSweepAcceptAndClaim(t *testing.T) {
 	}
 }
 
+func TestTaskSweepSkipsManualOnlyTasks(t *testing.T) {
+	b := &sweepBackend{
+		listFn: func(isMP bool) []map[string]any {
+			if isMP {
+				return nil
+			}
+			return []map[string]any{
+				sweepTask("WorkBuddy_Valorant", 1, 1, "accepted", nil),
+			}
+		},
+	}
+	p := newSweepPanel(t, b, &auth.Auth{UID: "u1", AccessToken: "at"})
+	st := p.RunTaskSweepOnce()
+	if st.Claimed != 0 || st.Accepted != 0 || st.Errors != 0 {
+		t.Fatalf("manual-only 任务不得被清扫: %+v", st)
+	}
+	if got := b.claims.Load(); got != 0 {
+		t.Fatalf("manual-only 任务 claim 请求=%d want 0", got)
+	}
+}
+
 // TestTaskSweepIdempotent 两轮幂等：第二轮任务已被标记为 claimed（不再 Claimable），
 // 不应重复打领奖端点；即便上游返回 already_claimed 也不计错误。
 func TestTaskSweepIdempotent(t *testing.T) {

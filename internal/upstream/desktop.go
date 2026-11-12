@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -379,9 +380,18 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
+	return c.MarketExpertSearch(a, expertType, "")
+}
+
+// MarketExpertSearch 按关键词搜索专家市场；keyword 为空时等价于 MarketExpertList。
+// 活动任务常要求指定专家，默认推荐列表未必包含目标条目，必须走 keyword 搜索。
+func (c *Client) MarketExpertSearch(a *auth.Auth, expertType, keyword string) ([]MarketExpert, error) {
 	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword = strings.TrimSpace(keyword); keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

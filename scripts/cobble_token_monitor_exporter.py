@@ -57,6 +57,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "/home/xue/Cobble/data/model-calls/model-calls.jsonl",
         "/home/xue/Cobble/runs/*/data/model-calls/model-calls.jsonl",
     ],
+    "remote_sqlite_globs": [
+        "/home/xue/Cobble/control-plane/data/cairnre.sqlite3",
+        "/home/xue/Cobble/task/*/data/cairnre.sqlite3",
+        "/home/xue/Cobble-worktrees/*/control-plane/data/cairnre.sqlite3",
+    ],
     "hub_url": "http://127.0.0.1:17321",
     "state_file": str(DEFAULT_STATE_FILE),
     "secret_file": r"%APPDATA%\Token Monitor\credentials.json",
@@ -72,8 +77,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "retry_attempts": 5,
     "pricing_binary": str(DEFAULT_PRICING_BINARY),
     "pricing_cache_ttl_seconds": 86400,
+    "pricing_failure_cache_ttl_seconds": 300,
     "pricing_timeout_seconds": 12,
-    "pricing_min_model_tokens": 1000,
+    "pricing_min_model_tokens": 0,
     "pricing_max_lookups_per_run": 8,
     "pricing_concurrency": 6,
 }
@@ -82,9 +88,14 @@ REMOTE_COLLECTOR = r"""
 import glob
 import json
 import os
+import sqlite3
 import sys
 
-patterns = json.loads(sys.argv[1])
+selection = json.loads(sys.argv[1])
+if isinstance(selection, list):
+    selection = {"globs": selection, "sqlite_globs": []}
+patterns = selection.get("globs") or []
+sqlite_patterns = selection.get("sqlite_globs") or []
 records = []
 files = []
 errors = []
@@ -112,6 +123,16 @@ for pattern in patterns:
                 usage = obj.get("usage") or {}
                 if not isinstance(usage, dict):
                     usage = {}
+                cache_read = (
+                    usage.get("cache_read_input_tokens")
+                    or usage.get("cache_read_tokens")
+                    or 0
+                )
+                cache_write = (
+                    usage.get("cache_creation_input_tokens")
+                    or usage.get("cache_write_tokens")
+                    or 0
+                )
                 if "/runs/" in path:
                     source = path.split("/runs/", 1)[1].split("/data/model-calls/", 1)[0]
                 elif path.endswith("/data/model-calls/model-calls.jsonl"):
@@ -125,11 +146,70 @@ for pattern in patterns:
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(usage.get("completion_tokens") or 0),
                     "total_tokens": int(usage.get("total_tokens") or 0),
+                    "cache_read": int(cache_read or 0),
+                    "cache_write": int(cache_write or 0),
                     "duration_ms": int(obj.get("duration_ms") or 0),
                     "attempts": int(obj.get("attempts") or 0),
                     "error": str(obj.get("error") or ""),
                     "source": source,
                 })
+        files.append(info)
+
+for pattern in sqlite_patterns:
+    for path in sorted(glob.glob(pattern)):
+        if not os.path.isfile(path):
+            continue
+        info = {"path": path, "kind": "sqlite", "rows": 0, "bytes": os.path.getsize(path)}
+        try:
+            uri = "file:" + path.replace("?", "%3F") + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, timeout=5)
+            connection.row_factory = sqlite3.Row
+        except Exception as exc:
+            errors.append({"path": path, "error": str(exc)})
+            continue
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "llm_calls" not in tables:
+                continue
+            attempt_count = (
+                "(SELECT COUNT(*) FROM llm_attempts a WHERE a.call_id = c.id)"
+                if "llm_attempts" in tables
+                else "0"
+            )
+            query = '''
+                SELECT c.id, c.created_at, c.model, c.input_tokens,
+                       c.output_tokens, c.total_tokens, c.cache_read_tokens,
+                       c.cache_write_tokens, c.elapsed_ms, c.error_category,
+                       c.error_code, %s AS attempts
+                FROM llm_calls c
+                ORDER BY c.created_at, c.id
+            ''' % attempt_count
+            for row in connection.execute(query):
+                error_parts = [str(value or "") for value in (row[9], row[10])]
+                records.append({
+                    "id": str(row[0] or ""),
+                    "timestamp": str(row[1] or ""),
+                    "model": str(row[2] or ""),
+                    "prompt_tokens": int(row[3] or 0),
+                    "completion_tokens": int(row[4] or 0),
+                    "total_tokens": int(row[5] or 0),
+                    "cache_read": int(row[6] or 0),
+                    "cache_write": int(row[7] or 0),
+                    "duration_ms": int(row[8] or 0),
+                    "attempts": int(row[11] or 0),
+                    "error": ": ".join(value for value in error_parts if value),
+                    "source": "sqlite:" + path,
+                })
+                info["rows"] += 1
+        except Exception as exc:
+            errors.append({"path": path, "error": str(exc)})
+        finally:
+            connection.close()
         files.append(info)
 print(json.dumps({"records": records, "files": files, "errors": errors}, ensure_ascii=True))
 """
@@ -251,6 +331,9 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     config["pricing_cache_ttl_seconds"] = max(
         0, int(config.get("pricing_cache_ttl_seconds") or 0)
     )
+    config["pricing_failure_cache_ttl_seconds"] = max(
+        0, int(config.get("pricing_failure_cache_ttl_seconds") or 0)
+    )
     config["pricing_timeout_seconds"] = max(
         1, int(config.get("pricing_timeout_seconds") or 12)
     )
@@ -267,8 +350,12 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         raise ConfigError("ssh_host is required")
     if not config["ssh_user"]:
         raise ConfigError("ssh_user is required")
-    if not isinstance(config.get("remote_globs"), list) or not config["remote_globs"]:
-        raise ConfigError("remote_globs must be a non-empty JSON array")
+    if not isinstance(config.get("remote_globs"), list):
+        raise ConfigError("remote_globs must be a JSON array")
+    if not isinstance(config.get("remote_sqlite_globs"), list):
+        raise ConfigError("remote_sqlite_globs must be a JSON array")
+    if not config["remote_globs"] and not config["remote_sqlite_globs"]:
+        raise ConfigError("remote_globs or remote_sqlite_globs must be non-empty")
     return config
 
 
@@ -317,7 +404,11 @@ def connect_ssh(config: dict[str, Any]) -> Any:
 def collect_remote(config: dict[str, Any]) -> dict[str, Any]:
     client = connect_ssh(config)
     try:
-        command = "python3 - " + json.dumps(json.dumps(config["remote_globs"]))
+        selection = {
+            "globs": config["remote_globs"],
+            "sqlite_globs": config.get("remote_sqlite_globs") or [],
+        }
+        command = "python3 - " + json.dumps(json.dumps(selection))
         stdin, stdout, stderr = client.exec_command(command, timeout=60)
         stdin.write(REMOTE_COLLECTOR)
         stdin.channel.shutdown_write()
@@ -357,12 +448,17 @@ def add_cobble_record(
         total = prompt + completion
     if total <= 0:
         return False
+    cache_read = min(prompt, max(0, int(record.get("cache_read") or 0)))
+    cache_write = min(
+        max(0, prompt - cache_read),
+        max(0, int(record.get("cache_write") or 0)),
+    )
     model = normalize_model(record.get("model"))
     duration_ms = max(0, int(record.get("duration_ms") or 0))
 
-    # Cobble does not expose cache hit/miss. Treat prompt tokens as normal
-    # input for pricing; Token Monitor will show zero cache hit for this source.
     period["totalTokens"] += total
+    period["cacheReadTokens"] += cache_read
+    period["cacheWriteTokens"] += cache_write
     period["outputTokens"] += min(total, completion)
     period["timedTokens"] += total
     period["timedOutputTokens"] += min(total, completion)
@@ -371,8 +467,12 @@ def add_cobble_record(
 
     tm.add_number_map(period["clients"], {client: total})
     tm.add_number_map(period["clientMessages"], {client: 1})
+    tm.add_number_map(period["clientCacheReads"], {client: cache_read})
+    tm.add_number_map(period["clientCacheWrites"], {client: cache_write})
     tm.add_number_map(period["clientOutputs"], {client: min(total, completion)})
     tm.add_number_map(period["models"], {model: total})
+    tm.add_number_map(period["modelCacheReads"], {model: cache_read})
+    tm.add_number_map(period["modelCacheWrites"], {model: cache_write})
     tm.add_number_map(period["modelOutputs"], {model: min(total, completion)})
     tm.add_number_map(period["clientModels"].setdefault(client, {}), {model: total})
     return True
@@ -577,7 +677,9 @@ def run_cycle(config: dict[str, Any], args: argparse.Namespace) -> int:
             for item in files:
                 print(
                     f"[cobble-export] file {item.get('path')} "
-                    f"lines={item.get('lines')} bytes={item.get('bytes')}",
+                    f"kind={item.get('kind', 'jsonl')} "
+                    f"lines={item.get('lines', item.get('rows', 0))} "
+                    f"bytes={item.get('bytes')}",
                     flush=True,
                 )
 

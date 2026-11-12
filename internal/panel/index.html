@@ -502,6 +502,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
   .pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 9px;
     border-radius: 5px; background: var(--surface-2); overflow: hidden; }
+  .pk-expiry-fill { display: flex; align-items: stretch; gap: 2px; height: 100%;
+    min-width: 3px; max-width: 100%; border-radius: 5px; overflow: hidden; }
   .pk-expiry-seg { display: block; min-width: 3px; height: 100%; cursor: default;
     background: var(--seg-color, var(--accent)); transition: filter .15s, transform .15s; }
   .pk-expiry-seg:hover { filter: brightness(1.12); transform: scaleY(1.35); }
@@ -747,14 +749,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-taskscenter" hidden>
       <div class="box">
         <header>
-          <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
+          <h3>任务执行队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
           <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <label class="sel-note">并发
-            <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+            <select id="qcConc"><option value="1" selected>1</option></select>
           </label>
           <button class="xs" id="btnScanAll">扫描待办</button>
-          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
+          <button class="xs primary" id="btnRunQueue">执行自动待办</button>
         </header>
         <div class="qprog" id="qProg" hidden>
           <div class="qbar"><i id="qBarFill"></i></div>
@@ -767,7 +769,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
           </svg>
           <div class="t">还没有扫描过</div>
-          <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+          <div class="d">扫描所有账号的成长任务与活动任务，自动任务可排队执行，需客户端交互的任务会标记为需手动。</div>
         </div>
         <div id="qcList"></div>
       </div>
@@ -1250,7 +1252,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:940px">
     <header>
       <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
-      <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
+      <div class="hint">任务逐项执行，执行成功后不会自动领奖；「领奖」在进度达标后由你单独点击。所有账号的执行动作全局串行。</div>
     </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
@@ -1264,7 +1266,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button id="btnTaskAcceptAll">全部接受</button>
-      <button id="btnTaskAutoAll" class="primary">一键完成可自动任务</button>
+      <button id="btnTaskAutoAll" class="primary" hidden>一键完成可自动任务（旧入口）</button>
       <button id="btnTaskReload">重新查询</button>
       <button id="btnCloseTask">关闭</button>
     </footer>

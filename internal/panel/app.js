@@ -264,6 +264,7 @@ function rateLimitMeta(row, now) {
     };
   }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  let detail;
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
     // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
@@ -1572,6 +1573,7 @@ start();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null;
+let taskExecBusy = false;
 
 // 可自动完成的任务（与后端 autoActions 表一致）：判据为行为事件、可经网关复现。
 // 其余任务需在官方客户端内交互，面板只展示指引（行 title 提示）。
@@ -1594,14 +1596,22 @@ const AUTO_TASKS = {
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
-  'school_season': '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）',
-  'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
-  'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）',
-  'Sequential_Tasks_3': '小程序五次对话（小程序口径）：accept → mini 对话上报 ×5（自动补差额）→ 领奖（+300c+5e）',
-  'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 领奖（判据待解锁验证）',
-  'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）',
-  'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖',
-  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
+  'skill_share': '选择一个已导入技能并生成真实分享链接；执行后不自动领奖',
+  'WorkBuddy_Valorant': '搜索并召唤「无畏契约拼豆专家」→ 真实对话 → expert_actual_use 上报',
+  'expert_use_maidehao': '搜索并召唤「中国电商运营专家」→ 真实对话 → expert_actual_use 上报',
+  'expert_use_douyinyin': '搜索并召唤「抖音策略师」→ 真实对话 → expert_actual_use 上报',
+  'expert_use_shangjia_xuanchuan': '搜索并召唤「商家宣传页与海报设计师」→ 真实对话 → expert_actual_use 上报',
+  'expert_use_bowangwang': '搜索并召唤「直播电商教练」→ 真实对话 → expert_actual_use 上报',
+  'starbucks:ai_chat': '逐步上报 3 次小程序对话，每次回读进度；执行后不自动领奖',
+  'starbucks:expert': '搜索真实专家并上报小程序专家使用事件；执行后不自动领奖',
+  'school_season': '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 回读进度',
+  'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 回读进度',
+  'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 回读进度',
+  'Sequential_Tasks_3': '小程序五次对话（小程序口径）：accept → mini 对话上报 ×5（自动补差额）→ 回读进度',
+  'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 回读进度',
+  'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 回读进度',
+  'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 回读进度',
+  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 回读进度'
 };
 
 function openTasks(uid) {
@@ -1658,7 +1668,15 @@ async function loadTasks() {
   tb.hidden = true;
   try {
     const d = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks');
-    const list = d.tasks || [];
+    const growth = (d.tasks || []).map(t => ({ ...t, source: 'growth' }));
+    const starbucks = (d.starbucks || []).map(t => ({
+      ...t,
+      source: 'starbucks',
+      claimable: !!t.completed && !t.claimed,
+      credit: t.reward_credit || 0,
+      accept_status: t.completed ? 'completed' : 'accepted',
+    }));
+    const list = growth.concat(starbucks);
     if (!list.length) {
       st.className = 'state';
       st.textContent = '该账号暂无任务';
@@ -1673,6 +1691,7 @@ async function loadTasks() {
       const parts = [];
       if (t.credit) parts.push('+' + t.credit + ' 分');
       if (t.energy) parts.push('+' + t.energy + ' 能');
+      if (t.reward_chance) parts.push('+' + t.reward_chance + ' 抽奖');
       if (t.reward_buddy) parts.push('Buddy');
       const reward = parts.length ? parts.join(' ') : '—';
       const badge = t.claimed ? '<span class="tag ok">已领取</span>'
@@ -1680,15 +1699,25 @@ async function loadTasks() {
         : t.locked ? '<span class="tag mute">未解锁</span>'
         : t.accept_status === 'accepted' ? '<span class="tag mute">进行中</span>'
         : '<span class="tag mute">未接受</span>';
-      const acted = t.claimed || t.locked ? ''
-        : t.claimable ? '<button class="xs primary" data-t="claim" data-c="' + esc(t.task_code) + '">领取</button>'
-        : AUTO_TASKS[t.task_code] ? '<button class="xs primary" data-t="auto" data-c="' + esc(t.task_code) + '" title="' + esc(AUTO_TASKS[t.task_code]) + '">一键完成</button>'
-        : t.accept_status === 'accepted' ? ''
-        : '<button class="xs" data-t="accept" data-c="' + esc(t.task_code) + '">接受</button>';
+      const actionKey = t.source === 'starbucks' ? 'starbucks:' + t.task_code : t.task_code;
+      const actionDesc = AUTO_TASKS[actionKey] || '';
+      const supported = !!actionDesc;
+      let acted = '';
+      if (!t.claimed) {
+        if (t.source === 'growth' && !t.locked && t.accept_status !== 'accepted' && t.accept_status !== 'completed') {
+          acted += '<button class="xs" data-t="accept" data-c="' + esc(t.task_code) + '">接受</button>';
+        }
+        acted += '<button class="xs' + (supported && !t.claimable ? ' primary' : '') + '" data-t="execute" data-c="' + esc(t.task_code) + '" data-s="' + esc(t.source) + '"'
+          + ((!supported || t.locked || t.claimable || taskExecBusy) ? ' disabled' : '')
+          + ' title="' + esc(supported ? actionDesc : '该任务暂无自动执行动作，请按任务说明手动完成') + '">执行</button>';
+        acted += '<button class="xs primary" data-t="claim" data-c="' + esc(t.task_code) + '" data-s="' + esc(t.source) + '"'
+          + ((!t.claimable || taskExecBusy) ? ' disabled' : '')
+          + ' title="任务达标后手动领取奖励">领奖</button>';
+      }
       // 操作指引（description/task_desc）挂 title 提示：如何完成交给用户看
       const tip = [t.title, t.task_desc || t.description, t.jump_url ? '跳转：' + t.jump_url : ''].filter(Boolean).join('\n');
       return '<tr title="' + esc(tip) + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-        '<td class="who"><div class="nm">' + esc(t.title || t.task_code) + '</div><div class="id">' + esc(t.task_code) + (t.tag ? ' · ' + esc(t.tag) : '') + '</div></td>' +
+        '<td class="who"><div class="nm">' + esc(t.title || t.task_code) + '</div><div class="id">' + esc(t.task_code) + (t.source === 'starbucks' ? ' · 星巴克' : (t.tag ? ' · ' + esc(t.tag) : '')) + '</div></td>' +
         '<td class="num">' + esc(prog) + '</td>' +
         '<td class="num">' + esc(reward) + '</td>' +
         '<td>' + badge + '</td>' +
@@ -1708,11 +1737,13 @@ $('taskBody').addEventListener('click', async ev => {
   const kind = b.dataset.t, code = b.dataset.c;
   b.disabled = true;
   try {
-    if (kind === 'auto') {
-      // 一键完成：后端执行动作 → 回读进度 → 汇报（耗时可到分钟级，含真实对话）
+    if (kind === 'execute') {
+      // 只执行任务，不自动领奖；领奖由独立按钮触发。
+      taskExecBusy = true;
+      document.querySelectorAll('#taskBody button[data-t]').forEach(x => { x.disabled = true; });
       b.textContent = '执行中…';
       const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto', {
-        method: 'POST', body: JSON.stringify({ task_code: code })
+        method: 'POST', body: JSON.stringify({ task_code: code, source: b.dataset.s || 'growth' })
       });
       if (r.skipped) {
         toast(r.message || '已跳过', 'ok');
@@ -1720,21 +1751,20 @@ $('taskBody').addEventListener('click', async ev => {
         const advanced = r.progress_before !== r.progress_after;
         let msg = r.message || '已执行';
         if (r.progress_after) msg += `（进度 ${r.progress_before} → ${r.progress_after}）`;
-        if (r.claimed) msg += '，奖励已自动到账';
-        else if (r.claimable) msg += r.claim_error ? '，可点「领取」重试' : '';
+        if (r.claimable) msg += '，已达标，可点击「领奖」';
         else if (r.attempt && !advanced) msg += '；进度未动，该任务可能需要官方客户端';
-        toast(msg, (r.claimed || advanced) ? 'ok' : 'err');
+        toast(msg, advanced || r.claimable ? 'ok' : 'err');
       }
       loadOverview(true);
     } else {
       const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');
-      const body = kind === 'claim' ? { task_code: code } : { task_codes: [code] };
+      const body = kind === 'claim' ? { task_code: code, source: b.dataset.s || 'growth' } : { task_codes: [code] };
       await api(path, { method: 'POST', body: JSON.stringify(body) });
-      toast(kind === 'claim' ? '已领取奖励' : '已接受任务', 'ok');
+      toast(kind === 'claim' ? '领奖请求已完成' : '已接受任务', 'ok');
       if (kind === 'claim') loadOverview(true);
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { loadTasks(); }
+  finally { taskExecBusy = false; loadTasks(); }
 });
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
@@ -1995,6 +2025,12 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+const STARBUCKS_TITLES = {
+  ai_chat: '简单任务，AI 搞定',
+  expert: '复杂任务，专家帮忙',
+  app: '解锁 App 强大能力',
+  invite: '邀请好友',
+};
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
@@ -2003,13 +2039,13 @@ $('btnScanAll').onclick = async () => {
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
-    renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与活动待办均已完成，明日再来。');
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
-  if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
+  if (!confirm('扫描并排队执行可自动完成的待办（账号并发 ' + conc + '，账号内串行）。\n需手动任务只标记、不执行；含真实对话的任务耗时较长，确认继续？')) return;
   const b = $('btnRunQueue');
   b.disabled = true; b.textContent = '启动中…';
   try {
@@ -2019,7 +2055,7 @@ $('btnRunQueue').onclick = async () => {
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; b.textContent = '执行全部待办'; }
+  finally { b.disabled = false; b.textContent = '执行自动待办'; }
 };
 // 扫描结果 → 分组条目（无执行状态）
 function groupItems(d) {
@@ -2028,21 +2064,38 @@ function groupItems(d) {
     const rows = [];
     for (const t of (a.growth || [])) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
-      rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan' });
+      const auto = t.executable !== false;
+      rows.push({
+        kind: 'growth', code: t.task_code,
+        prog: t.target ? t.current + '/' + t.target : '—',
+        status: auto ? 'scan' : 'manual',
+        message: auto ? (t.action || '') : (t.action || '需在官方客户端或活动页手动完成'),
+      });
+    }
+    for (const t of (a.starbucks || [])) {
+      STARBUCKS_TITLES[t.task_code] = t.title || t.task_code;
+      const auto = t.executable === true;
+      rows.push({
+        kind: 'starbucks', code: t.task_code,
+        prog: t.target ? t.current + '/' + t.target : '—',
+        status: auto ? 'scan' : 'manual',
+        message: t.action || (auto ? '可自动领取活动奖励' : '需在星巴克活动页手动完成'),
+      });
     }
     if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
   }
   return groups;
 }
-const ST_WORDS = { done: '完成', running: '执行中', error: '失败', skipped: '跳过', pending: '排队', scan: '待执行' };
+const ST_WORDS = { done: '完成', running: '执行中', error: '失败', skipped: '跳过', pending: '排队', scan: '待执行', manual: '需手动' };
 function qrowHTML(it) {
   const isSchool = it.kind === 'school';
-  const title = isSchool ? '开学季闭环' : (GROWTH_TITLES[it.code] || it.code);
-  const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : it.status === 'skipped' ? 'skip' : it.status === 'done' ? 'done' : 'wait';
-  const stWord = it.status === 'scan' ? '待执行' : (ST_WORDS[it.status] || it.status);
+  const isStarbucks = it.kind === 'starbucks';
+  const title = isSchool ? '开学季闭环' : isStarbucks ? (STARBUCKS_TITLES[it.code] || it.code) : (GROWTH_TITLES[it.code] || it.code);
+  const dotCls = it.status === 'scan' ? 'wait' : it.status === 'running' ? 'run' : it.status === 'error' ? 'err' : (it.status === 'skipped' || it.status === 'manual') ? 'skip' : it.status === 'done' ? 'done' : 'wait';
+  const stWord = ST_WORDS[it.status] || it.status;
   return '<div class="qrow" title="' + esc(it.message || '') + '">' +
     '<span class="code">' + esc(it.code) + '</span>' +
-    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : '') + '</span>' +
+    '<span class="name"><span class="t">' + esc(title) + '</span>' + (isSchool ? '<span class="tag mute">开学季</span>' : isStarbucks ? '<span class="tag mute">星巴克</span>' : '') + '</span>' +
     '<span class="prog">' + esc(it.prog || '') + '</span>' +
     '<span class="st"><span class="qdot ' + dotCls + '"></span>' + stWord + '</span>' +
     '<span class="msg">' + esc(it.message || '') + '</span>' +
@@ -2867,9 +2920,18 @@ function summarizeCreditDays(list, now) {
   return { rows, accountCount: (list || []).length, unavailable };
 }
 
+// expiryRowPct 主到期图的跨行比例：以全部到期批次的最高积分为 100%。
+// 旧实现每行都按自身总额归一化，导致 30 与 300 都铺满轨道。
+function expiryRowPct(credits, maxCredits) {
+  const n = Number(credits), m = Number(maxCredits);
+  if (!Number.isFinite(n) || !Number.isFinite(m) || m <= 0) return 0;
+  return Math.max(0, Math.min(100, n / m * 100));
+}
+
 function renderExpiryDistribution(list, now) {
   const summary = summarizeCreditDays(list, now);
   const colors = pkAccountColorMap(list);
+  const maxCredits = Math.max(1, ...summary.rows.map(row => row.credits || 0));
   const rows = summary.rows.map(row => {
     const total = row.credits || 1;
     const nodes = row.segments.map(segment => {
@@ -2883,7 +2945,9 @@ function renderExpiryDistribution(list, now) {
         ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
     }).join('');
     return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
-      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
+      '</span><div class="pk-expiry-track" title="柱宽按全部到期批次的最大积分等比缩放">' +
+      '<div class="pk-expiry-fill" style="width:' + expiryRowPct(row.credits, maxCredits).toFixed(4) +
+      '%">' + nodes + '</div></div><b>' + esc(fmtTok(row.credits)) +
       '</b></div>';
   }).join('');
   const foot = summary.accountCount + ' 个账号' +

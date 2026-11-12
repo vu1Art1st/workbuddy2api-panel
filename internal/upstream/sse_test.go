@@ -905,14 +905,16 @@ func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 	}
 }
 func TestCreditPackagesExpiryTimestamp(t *testing.T) {
-	end := time.Now().In(softRateResetLoc).Add(7 * 24 * time.Hour).Truncate(time.Second)
+	now := time.Now().In(softRateResetLoc)
+	end := now.Add(7 * 24 * time.Hour).Truncate(time.Second)
+	far := now.AddDate(9, 0, 0).Truncate(time.Second)
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
 			return nil, errors.New("wrong path: " + r.URL.Path)
 		}
 		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[`+
 			`{"PackageName":"gift","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20,"CycleEndTime":"`+
-			end.Format(packageEndLayout)+`"},`+
+			end.Format(packageEndLayout)+`","DeductionEndTime":`+strconv.FormatInt(far.UnixMilli(), 10)+`},`+
 			`{"PackageName":"unknown","CycleCapacitySize":10,"CycleCapacityRemain":10,"CycleCapacityUsed":0}`+
 			`]}}}}`), nil
 	})
@@ -934,13 +936,12 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 	}
 }
 
-// TestUserResourceSnapshotDeductionEndTime 钉住快照与「检查」同口径：
-//  1. 体验版包必须用 DeductionEndTime（真失效时刻），不能把 CycleEndTime（周期
-//     重置日）当成到期日——线上表现就是 10-31 错报、实际 2035 年才失效；
+// TestUserResourceSnapshotCycleEndTime 钉住快照与「检查」同口径：
+//  1. 周期包必须用 CycleEndTime（当前周期额度的刷新/作废点），不能把
+//     DeductionEndTime（订阅合同可抵扣期限，可能到 2034/2035 年）当成积分到期日；
 //  2. 同一天多个包要合并成一个自然日批次，earliestRemaining 是该日合计；
-//  3. CreditPackages（检查）与 UserResourceSnapshot（首页快照）对同一个包给出
-//     同一个失效时刻。
-func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
+//  3. CreditPackages（检查）与 UserResourceSnapshot（首页快照）给出同一个失效时刻。
+func TestUserResourceSnapshotCycleEndTime(t *testing.T) {
 	now := time.Now().In(softRateResetLoc)
 	today := now
 	day2 := time.Date(today.Year(), today.Month(), today.Day()+2, 9, 0, 0, 0, softRateResetLoc)
@@ -983,8 +984,8 @@ func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
 	if buckets[0].Date != day || buckets[0].Remain != 150 || !buckets[0].ExpireAt.Equal(day2) {
 		t.Fatalf("bucket[0]=%+v want date=%s remain=150 expire=%v", buckets[0], day, day2)
 	}
-	if buckets[1].Remain != 488 || !buckets[1].ExpireAt.Equal(far) {
-		t.Fatalf("experience bucket=%+v want remain=488 expire=%v（不是 CycleEndTime %v）", buckets[1], far, cycleOnly)
+	if buckets[1].Remain != 488 || !buckets[1].ExpireAt.Equal(cycleOnly) {
+		t.Fatalf("experience bucket=%+v want remain=488 expire=%v（不是 DeductionEndTime %v）", buckets[1], cycleOnly, far)
 	}
 
 	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
@@ -992,9 +993,24 @@ func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
 		t.Fatalf("packages: %v", err)
 	}
 	for _, p := range packs {
-		if p.Name == "experience" && p.ExpiresAt != far.UnixMilli() {
-			t.Fatalf("CreditPackages experience expires_at=%d want %d（两条路径必须同口径）", p.ExpiresAt, far.UnixMilli())
+		if p.Name == "experience" && p.ExpiresAt != cycleOnly.UnixMilli() {
+			t.Fatalf("CreditPackages experience expires_at=%d want %d（两条路径必须同口径）", p.ExpiresAt, cycleOnly.UnixMilli())
 		}
+	}
+}
+
+// TestPackageEffectiveEndFallback 周期包缺少 CycleEndTime 时仍回落 DeductionEndTime；
+// 非周期包维持原有合同期限优先语义，避免一次修正误伤一次性积分包。
+func TestPackageEffectiveEndFallback(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	deduction := now.AddDate(8, 0, 0).Truncate(time.Second)
+	cycleEnd := now.Add(14 * 24 * time.Hour).Truncate(time.Second)
+
+	if got, ok := packageEffectiveEnd(false, deduction.UnixMilli(), "", "", cycleEnd.Format(packageEndLayout)); !ok || !got.Equal(deduction) {
+		t.Fatalf("non-cycle end=%v ok=%v want deduction=%v", got, ok, deduction)
+	}
+	if got, ok := packageEffectiveEnd(true, deduction.UnixMilli(), "", "", ""); !ok || !got.Equal(deduction) {
+		t.Fatalf("cycle fallback end=%v ok=%v want deduction=%v", got, ok, deduction)
 	}
 }
 
